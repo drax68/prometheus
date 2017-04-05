@@ -25,10 +25,6 @@ import (
 	"github.com/prometheus/prometheus/storage/metric"
 )
 
-const (
-	headChunkTimeout = time.Hour // Close head chunk if not touched for that long.
-)
-
 // fingerprintSeriesPair pairs a fingerprint with a memorySeries pointer.
 type fingerprintSeriesPair struct {
 	fp     model.Fingerprint
@@ -110,26 +106,18 @@ func (sm *seriesMap) iter() <-chan fingerprintSeriesPair {
 	return ch
 }
 
-// fpIter returns a channel that produces all fingerprints in the seriesMap. The
-// channel will be closed once all fingerprints have been received. Not
-// consuming all fingerprints from the channel will leak a goroutine. The
-// semantics of concurrent modification of seriesMap is the similar as the one
-// for iterating over a map with a 'range' clause. However, if the next element
-// in iteration order is removed after the current element has been received
-// from the channel, it will still be produced by the channel.
-func (sm *seriesMap) fpIter() <-chan model.Fingerprint {
-	ch := make(chan model.Fingerprint)
-	go func() {
-		sm.mtx.RLock()
-		for fp := range sm.m {
-			sm.mtx.RUnlock()
-			ch <- fp
-			sm.mtx.RLock()
-		}
-		sm.mtx.RUnlock()
-		close(ch)
-	}()
-	return ch
+// sortedFPs returns a sorted slice of all the fingerprints in the seriesMap.
+func (sm *seriesMap) sortedFPs() model.Fingerprints {
+	sm.mtx.RLock()
+	fps := make(model.Fingerprints, 0, len(sm.m))
+	for fp := range sm.m {
+		fps = append(fps, fp)
+	}
+	sm.mtx.RUnlock()
+
+	// Sorting could take some time, so do it outside of the lock.
+	sort.Sort(fps)
+	return fps
 }
 
 type memorySeries struct {
@@ -247,7 +235,9 @@ func (s *memorySeries) add(v model.SamplePair) (int, error) {
 
 	// Populate lastTime of now-closed chunks.
 	for _, cd := range s.chunkDescs[len(s.chunkDescs)-len(chunks) : len(s.chunkDescs)-1] {
-		cd.MaybePopulateLastTime()
+		if err := cd.MaybePopulateLastTime(); err != nil {
+			return 0, err
+		}
 	}
 
 	s.lastTime = v.Timestamp
@@ -257,43 +247,44 @@ func (s *memorySeries) add(v model.SamplePair) (int, error) {
 }
 
 // maybeCloseHeadChunk closes the head chunk if it has not been touched for the
-// duration of headChunkTimeout. It returns whether the head chunk was closed.
-// If the head chunk is already closed, the method is a no-op and returns false.
+// provided duration. It returns whether the head chunk was closed.  If the head
+// chunk is already closed, the method is a no-op and returns false.
 //
 // The caller must have locked the fingerprint of the series.
-func (s *memorySeries) maybeCloseHeadChunk() bool {
+func (s *memorySeries) maybeCloseHeadChunk(timeout time.Duration) (bool, error) {
 	if s.headChunkClosed {
-		return false
+		return false, nil
 	}
-	if time.Now().Sub(s.lastTime.Time()) > headChunkTimeout {
+	if time.Now().Sub(s.lastTime.Time()) > timeout {
 		s.headChunkClosed = true
 		// Since we cannot modify the head chunk from now on, we
 		// don't need to bother with cloning anymore.
 		s.headChunkUsedByIterator = false
-		s.head().MaybePopulateLastTime()
-		return true
+		return true, s.head().MaybePopulateLastTime()
 	}
-	return false
+	return false, nil
 }
 
-// evictChunkDescs evicts chunkDescs if the chunk is evicted.
-// iOldestNotEvicted is the index within the current chunkDescs of the oldest
-// chunk that is not evicted.
-func (s *memorySeries) evictChunkDescs(iOldestNotEvicted int) {
-	lenToKeep := len(s.chunkDescs) - iOldestNotEvicted
-	if lenToKeep < len(s.chunkDescs) {
-		s.savedFirstTime = s.firstTime()
-		lenEvicted := len(s.chunkDescs) - lenToKeep
-		s.chunkDescsOffset += lenEvicted
-		s.persistWatermark -= lenEvicted
-		chunk.DescOps.WithLabelValues(chunk.Evict).Add(float64(lenEvicted))
-		chunk.NumMemDescs.Sub(float64(lenEvicted))
-		s.chunkDescs = append(
-			make([]*chunk.Desc, 0, lenToKeep),
-			s.chunkDescs[lenEvicted:]...,
-		)
-		s.dirty = true
+// evictChunkDescs evicts chunkDescs. lenToEvict is the index within the current
+// chunkDescs of the oldest chunk that is not evicted.
+func (s *memorySeries) evictChunkDescs(lenToEvict int) {
+	if lenToEvict < 1 {
+		return
 	}
+	if s.chunkDescsOffset < 0 {
+		panic("chunk desc eviction requested with unknown chunk desc offset")
+	}
+	lenToKeep := len(s.chunkDescs) - lenToEvict
+	s.savedFirstTime = s.firstTime()
+	s.chunkDescsOffset += lenToEvict
+	s.persistWatermark -= lenToEvict
+	chunk.DescOps.WithLabelValues(chunk.Evict).Add(float64(lenToEvict))
+	chunk.NumMemDescs.Sub(float64(lenToEvict))
+	s.chunkDescs = append(
+		make([]*chunk.Desc, 0, lenToKeep),
+		s.chunkDescs[lenToEvict:]...,
+	)
+	s.dirty = true
 }
 
 // dropChunks removes chunkDescs older than t. The caller must have locked the
@@ -418,7 +409,7 @@ func (s *memorySeries) preloadChunksForInstant(
 	from model.Time, through model.Time,
 	mss *MemorySeriesStorage,
 ) (SeriesIterator, error) {
-	// If we have a lastSamplePair in the series, and thas last samplePair
+	// If we have a lastSamplePair in the series, and this last samplePair
 	// is in the interval, just take it in a singleSampleSeriesIterator. No
 	// need to pin or load anything.
 	lastSample := s.lastSamplePair()
@@ -461,9 +452,9 @@ func (s *memorySeries) preloadChunksForRange(
 				fp, s.chunkDescsOffset, len(cds),
 			)
 		}
+		s.persistWatermark += len(cds)
 		s.chunkDescs = append(cds, s.chunkDescs...)
 		s.chunkDescsOffset = 0
-		s.persistWatermark += len(cds)
 		if len(s.chunkDescs) > 0 {
 			firstChunkDescTime = s.chunkDescs[0].FirstTime()
 		}

@@ -46,7 +46,10 @@ Prometheus.Graph.prototype.initialize = function() {
 
   // Draw graph controls and container from Handlebars template.
 
-  var options = {'pathPrefix': PATH_PREFIX};
+  var options = {
+    'pathPrefix': PATH_PREFIX,
+    'buildVersion': BUILD_VERSION
+  };
   jQuery.extend(options, self.options);
   self.graphHTML = $(Mustache.render(graphTemplate, options));
   self.el.append(self.graphHTML);
@@ -212,13 +215,12 @@ Prometheus.Graph.prototype.populateInsertableMetrics = function() {
           items: "all",
           matcher: function(item) {
             // If we have result for current query, skip
-            if (!self.fuzzyResult.query || self.fuzzyResult.query !== this.query) {
+            if (self.fuzzyResult.query !== this.query) {
               self.fuzzyResult.query = this.query;
               self.fuzzyResult.map = {};
-              self.fuzzyResult.result = fuzzy.filter(this.query.replace('_', ' '), metrics, {
+              self.fuzzyResult.result = fuzzy.filter(this.query.replace(/ /g, ''), metrics, {
                 pre: '<strong>',
-                post: '</strong>',
-                extract: function(el) { return el.replace('_', ' ') }
+                post: '</strong>'
               });
               self.fuzzyResult.result.forEach(function(r) {
                 self.fuzzyResult.map[r.original] = r;
@@ -237,7 +239,7 @@ Prometheus.Graph.prototype.populateInsertableMetrics = function() {
           },
 
           highlighter: function (item) {
-            return $('<div>' + self.fuzzyResult.map[item].string.replace(' ', '_') + '</div>')
+            return $('<div>' + self.fuzzyResult.map[item].string + '</div>')
           },
         });
         // This needs to happen after attaching the typeahead plugin, as it
@@ -413,7 +415,8 @@ Prometheus.Graph.prototype.submitQuery = function() {
           return;
         }
         var duration = new Date().getTime() - startTime;
-        self.evalStats.html("Load time: " + duration + "ms <br /> Resolution: " + resolution + "s");
+        var totalTimeSeries = xhr.responseJSON.data.result.length;
+        self.evalStats.html("Load time: " + duration + "ms <br /> Resolution: " + resolution + "s <br />" + "Total time series: " + totalTimeSeries);
         self.spinner.hide();
       }
   });
@@ -820,7 +823,7 @@ function init() {
   });
 
   $.ajax({
-    url: PATH_PREFIX + "/static/js/graph_template.handlebar",
+    url: PATH_PREFIX + "/static/js/graph_template.handlebar?v=" + BUILD_VERSION,
     success: function(data) {
 
       graphTemplate = data;
