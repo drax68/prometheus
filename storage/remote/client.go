@@ -60,6 +60,10 @@ func NewClient(index int, conf *clientConfig) (*Client, error) {
 	}, nil
 }
 
+type recoverableError struct {
+	error
+}
+
 // Store sends a batch of samples to the HTTP endpoint.
 func (c *Client) Store(samples model.Samples) error {
 	req := &WriteRequest{
@@ -97,6 +101,8 @@ func (c *Client) Store(samples model.Samples) error {
 
 	httpReq, err := http.NewRequest("POST", c.url.String(), &buf)
 	if err != nil {
+		// Errors from NewRequest are from unparseable URLs, so are not
+		// recoverable.
 		return err
 	}
 	httpReq.Header.Add("Content-Encoding", "snappy")
@@ -108,11 +114,17 @@ func (c *Client) Store(samples model.Samples) error {
 
 	httpResp, err := ctxhttp.Do(ctx, c.client, httpReq)
 	if err != nil {
-		return err
+		// Errors from client.Do are from (for example) network errors, so are
+		// recoverable.
+		return recoverableError{err}
 	}
 	defer httpResp.Body.Close()
+
 	if httpResp.StatusCode/100 != 2 {
-		return fmt.Errorf("server returned HTTP status %s", httpResp.Status)
+		err = fmt.Errorf("server returned HTTP status %s", httpResp.Status)
+	}
+	if httpResp.StatusCode/100 == 5 {
+		return recoverableError{err}
 	}
 	return nil
 }
@@ -173,7 +185,11 @@ func (c *Client) Read(ctx context.Context, from, through model.Time, matchers me
 		return nil, fmt.Errorf("unable to unmarshal response body: %v", err)
 	}
 
-	return matrixFromProto(resp.Timeseries), nil
+	if len(resp.Results) != len(req.Queries) {
+		return nil, fmt.Errorf("responses: want %d, got %d", len(req.Queries), len(resp.Results))
+	}
+
+	return matrixFromProto(resp.Results[0].Timeseries), nil
 }
 
 func labelMatchersToProto(matchers metric.LabelMatchers) []*LabelMatcher {

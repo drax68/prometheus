@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"time"
@@ -50,6 +51,7 @@ const (
 	errorCanceled           = "canceled"
 	errorExec               = "execution"
 	errorBadData            = "bad_data"
+	errorInternal           = "internal"
 )
 
 var corsHeaders = map[string]string{
@@ -73,7 +75,7 @@ type targetRetriever interface {
 }
 
 type alertmanagerRetriever interface {
-	Alertmanagers() []string
+	Alertmanagers() []*url.URL
 }
 
 type response struct {
@@ -194,6 +196,8 @@ func (api *API) query(r *http.Request) (interface{}, *apiError) {
 			return nil, &apiError{errorCanceled, res.Err}
 		case promql.ErrQueryTimeout:
 			return nil, &apiError{errorTimeout, res.Err}
+		case promql.ErrStorage:
+			return nil, &apiError{errorInternal, res.Err}
 		}
 		return nil, &apiError{errorExec, res.Err}
 	}
@@ -427,8 +431,8 @@ func (api *API) alertmanagers(r *http.Request) (interface{}, *apiError) {
 	urls := api.alertmanagerRetriever.Alertmanagers()
 	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls))}
 
-	for i := range urls {
-		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: urls[i]}
+	for i, url := range urls {
+		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
 	}
 
 	return ams, nil
@@ -459,6 +463,8 @@ func respondError(w http.ResponseWriter, apiErr *apiError, data interface{}) {
 		code = 422
 	case errorCanceled, errorTimeout:
 		code = http.StatusServiceUnavailable
+	case errorInternal:
+		code = http.StatusInternalServerError
 	default:
 		code = http.StatusInternalServerError
 	}
