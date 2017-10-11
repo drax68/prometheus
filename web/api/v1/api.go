@@ -29,10 +29,12 @@ import (
 	"github.com/prometheus/common/route"
 	"golang.org/x/net/context"
 
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/retrieval"
 	"github.com/prometheus/prometheus/storage/local"
 	"github.com/prometheus/prometheus/storage/metric"
+	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/util/httputil"
 )
 
@@ -103,17 +105,28 @@ type API struct {
 	targetRetriever       targetRetriever
 	alertmanagerRetriever alertmanagerRetriever
 
-	now func() model.Time
+	now    func() model.Time
+	config func() config.Config
+	ready  func(http.HandlerFunc) http.HandlerFunc
 }
 
 // NewAPI returns an initialized API type.
-func NewAPI(qe *promql.Engine, st local.Storage, tr targetRetriever, ar alertmanagerRetriever) *API {
+func NewAPI(
+	qe *promql.Engine,
+	st local.Storage,
+	tr targetRetriever,
+	ar alertmanagerRetriever,
+	configFunc func() config.Config,
+	readyFunc func(http.HandlerFunc) http.HandlerFunc,
+) *API {
 	return &API{
 		QueryEngine:           qe,
 		Storage:               st,
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
-		now: model.Now,
+		now:    model.Now,
+		config: configFunc,
+		ready:  readyFunc,
 	}
 }
 
@@ -130,9 +143,9 @@ func (api *API) Register(r *route.Router) {
 				w.WriteHeader(http.StatusNoContent)
 			}
 		})
-		return prometheus.InstrumentHandler(name, httputil.CompressionHandler{
+		return api.ready(prometheus.InstrumentHandler(name, httputil.CompressionHandler{
 			Handler: hf,
-		})
+		}))
 	}
 
 	r.Options("/*path", instr("options", api.options))
@@ -147,6 +160,9 @@ func (api *API) Register(r *route.Router) {
 
 	r.Get("/targets", instr("targets", api.targets))
 	r.Get("/alertmanagers", instr("alertmanagers", api.alertmanagers))
+
+	r.Get("/status/config", instr("config", api.serveConfig))
+	r.Post("/read", api.ready(prometheus.InstrumentHandler("read", http.HandlerFunc(api.remoteRead))))
 }
 
 type queryData struct {
@@ -434,6 +450,58 @@ func (api *API) alertmanagers(r *http.Request) (interface{}, *apiError) {
 	}
 
 	return ams, nil
+}
+
+type prometheusConfig struct {
+	YAML string `json:"yaml"`
+}
+
+func (api *API) serveConfig(r *http.Request) (interface{}, *apiError) {
+	cfg := &prometheusConfig{
+		YAML: api.config().String(),
+	}
+	return cfg, nil
+}
+
+func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
+	req, err := remote.DecodeReadRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := remote.ReadResponse{
+		Results: make([]*remote.QueryResult, len(req.Queries)),
+	}
+	for i, query := range req.Queries {
+		querier, err := api.Storage.Querier()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer querier.Close()
+
+		from, through, matchers, err := remote.FromQuery(query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		iters, err := querier.QueryRange(r.Context(), from, through, matchers...)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resp.Results[i] = remote.ToQueryResult(remote.IteratorsToMatrix(iters, metric.Interval{
+			OldestInclusive: from,
+			NewestInclusive: through,
+		}))
+	}
+
+	if err := remote.EncodeReadResponse(&resp, w); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func respond(w http.ResponseWriter, data interface{}) {
