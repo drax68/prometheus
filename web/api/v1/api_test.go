@@ -48,10 +48,26 @@ func (f targetRetrieverFunc) Targets() []*scrape.Target {
 	return f()
 }
 
-type alertmanagerRetrieverFunc func() []*url.URL
+type testAlertmanagerRetriever struct{}
 
-func (f alertmanagerRetrieverFunc) Alertmanagers() []*url.URL {
-	return f()
+func (t testAlertmanagerRetriever) Alertmanagers() []*url.URL {
+	return []*url.URL{
+		{
+			Scheme: "http",
+			Host:   "alertmanager.example.com:8080",
+			Path:   "/api/v1/alerts",
+		},
+	}
+}
+
+func (t testAlertmanagerRetriever) DroppedAlertmanagers() []*url.URL {
+	return []*url.URL{
+		{
+			Scheme: "http",
+			Host:   "dropped.alertmanager.example.com:8080",
+			Path:   "/api/v1/alerts",
+		},
+	}
 }
 
 var samplePrometheusCfg = config.Config{
@@ -61,6 +77,11 @@ var samplePrometheusCfg = config.Config{
 	ScrapeConfigs:      []*config.ScrapeConfig{},
 	RemoteWriteConfigs: []*config.RemoteWriteConfig{},
 	RemoteReadConfigs:  []*config.RemoteReadConfig{},
+}
+
+var sampleFlagMap = map[string]string{
+	"flag1": "value1",
+	"flag2": "value2",
 }
 
 func TestEndpoints(t *testing.T) {
@@ -95,22 +116,17 @@ func TestEndpoints(t *testing.T) {
 		}
 	})
 
-	ar := alertmanagerRetrieverFunc(func() []*url.URL {
-		return []*url.URL{{
-			Scheme: "http",
-			Host:   "alertmanager.example.com:8080",
-			Path:   "/api/v1/alerts",
-		}}
-	})
+	var ar testAlertmanagerRetriever
 
 	api := &API{
 		Queryable:             suite.Storage(),
 		QueryEngine:           suite.QueryEngine(),
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
-		now:    func() time.Time { return now },
-		config: func() config.Config { return samplePrometheusCfg },
-		ready:  func(f http.HandlerFunc) http.HandlerFunc { return f },
+		now:      func() time.Time { return now },
+		config:   func() config.Config { return samplePrometheusCfg },
+		flagsMap: sampleFlagMap,
+		ready:    func(f http.HandlerFunc) http.HandlerFunc { return f },
 	}
 
 	start := time.Unix(0, 0)
@@ -441,6 +457,11 @@ func TestEndpoints(t *testing.T) {
 						URL: "http://alertmanager.example.com:8080/api/v1/alerts",
 					},
 				},
+				DroppedAlertmanagers: []*AlertmanagerTarget{
+					{
+						URL: "http://dropped.alertmanager.example.com:8080/api/v1/alerts",
+					},
+				},
 			},
 		},
 		{
@@ -448,6 +469,10 @@ func TestEndpoints(t *testing.T) {
 			response: &prometheusConfig{
 				YAML: samplePrometheusCfg.String(),
 			},
+		},
+		{
+			endpoint: api.serveFlags,
+			response: sampleFlagMap,
 		},
 	}
 

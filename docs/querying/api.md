@@ -356,9 +356,6 @@ $ curl http://localhost:9090/api/v1/targets
 
 ## Alertmanagers
 
-> This API is experimental as it is intended to be extended with Alertmanagers
-> dropped due to relabelling in the future.
-
 The following endpoint returns an overview of the current state of the
 Prometheus alertmanager discovery:
 
@@ -366,7 +363,7 @@ Prometheus alertmanager discovery:
 GET /api/v1/alertmanagers
 ```
 
-Currently only the active Alertmanagers are part of the response.
+Both the active and dropped Alertmanagers are part of the response.
 
 ```json
 $ curl http://localhost:9090/api/v1/alertmanagers
@@ -377,11 +374,67 @@ $ curl http://localhost:9090/api/v1/alertmanagers
       {
         "url": "http://127.0.0.1:9090/api/v1/alerts"
       }
+    ],
+    "droppedAlertmanagers": [
+      {
+        "url": "http://127.0.0.1:9093/api/v1/alerts"
+      }
     ]
   }
 }
 ```
 
+## Status
+
+Following status endpoints expose current Prometheus configuration.
+
+### Config
+
+The following endpoint returns currently loaded configuration file:
+
+```
+GET /api/v1/status/config
+```
+
+The config is returned as dumped YAML file. Due to limitation of the YAML
+library, YAML comments are not included.
+
+```json
+$ curl http://localhost:9090/api/v1/status/config
+{
+  "status": "success",
+  "data": {
+    "yaml": "<content of the loaded config file in YAML>",
+  }
+}
+```
+
+### Flags
+
+The following endpoint returns flag values that Prometheus was configured with:
+
+```
+GET /api/v1/status/flags
+```
+
+All values are in a form of "string".
+
+```json
+$ curl http://localhost:9090/api/v1/status/flags
+{
+  "status": "success",
+  "data": {
+    "alertmanager.notification-queue-capacity": "10000",
+    "alertmanager.timeout": "10s",
+    "log.level": "info",
+    "query.lookback-delta": "5m",
+    "query.max-concurrency": "20",
+    ...
+  }
+}
+```
+
+*New in v2.2*
 
 ## TSDB Admin APIs
 These are APIs that expose database functionalities for the advanced user. These APIs are not enabled unless the `--web.enable-admin-api` is set.

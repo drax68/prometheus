@@ -87,6 +87,7 @@ type targetRetriever interface {
 
 type alertmanagerRetriever interface {
 	Alertmanagers() []*url.URL
+	DroppedAlertmanagers() []*url.URL
 }
 
 type response struct {
@@ -108,15 +109,16 @@ type apiFunc func(r *http.Request) (interface{}, *apiError)
 // API can register a set of endpoints in a router and handle
 // them using the provided storage and query engine.
 type API struct {
-	Queryable   promql.Queryable
+	Queryable   storage.Queryable
 	QueryEngine *promql.Engine
 
 	targetRetriever       targetRetriever
 	alertmanagerRetriever alertmanagerRetriever
 
-	now    func() time.Time
-	config func() config.Config
-	ready  func(http.HandlerFunc) http.HandlerFunc
+	now      func() time.Time
+	config   func() config.Config
+	flagsMap map[string]string
+	ready    func(http.HandlerFunc) http.HandlerFunc
 
 	db          func() *tsdb.DB
 	enableAdmin bool
@@ -125,10 +127,11 @@ type API struct {
 // NewAPI returns an initialized API type.
 func NewAPI(
 	qe *promql.Engine,
-	q promql.Queryable,
+	q storage.Queryable,
 	tr targetRetriever,
 	ar alertmanagerRetriever,
 	configFunc func() config.Config,
+	flagsMap map[string]string,
 	readyFunc func(http.HandlerFunc) http.HandlerFunc,
 	db func() *tsdb.DB,
 	enableAdmin bool,
@@ -140,6 +143,7 @@ func NewAPI(
 		alertmanagerRetriever: ar,
 		now:         time.Now,
 		config:      configFunc,
+		flagsMap:    flagsMap,
 		ready:       readyFunc,
 		db:          db,
 		enableAdmin: enableAdmin,
@@ -180,6 +184,7 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/alertmanagers", instr("alertmanagers", api.alertmanagers))
 
 	r.Get("/status/config", instr("config", api.serveConfig))
+	r.Get("/status/flags", instr("flags", api.serveFlags))
 	r.Post("/read", api.ready(prometheus.InstrumentHandler("read", http.HandlerFunc(api.remoteRead))))
 
 	// Admin APIs
@@ -222,7 +227,7 @@ func (api *API) query(r *http.Request) (interface{}, *apiError) {
 		defer cancel()
 	}
 
-	qry, err := api.QueryEngine.NewInstantQuery(r.FormValue("query"), ts)
+	qry, err := api.QueryEngine.NewInstantQuery(api.Queryable, r.FormValue("query"), ts)
 	if err != nil {
 		return nil, &apiError{errorBadData, err}
 	}
@@ -296,7 +301,7 @@ func (api *API) queryRange(r *http.Request) (interface{}, *apiError) {
 		defer cancel()
 	}
 
-	qry, err := api.QueryEngine.NewRangeQuery(r.FormValue("query"), start, end, step)
+	qry, err := api.QueryEngine.NewRangeQuery(api.Queryable, r.FormValue("query"), start, end, step)
 	if err != nil {
 		return nil, &apiError{errorBadData, err}
 	}
@@ -396,7 +401,7 @@ func (api *API) series(r *http.Request) (interface{}, *apiError) {
 
 	var sets []storage.SeriesSet
 	for _, mset := range matcherSets {
-		s, err := q.Select(mset...)
+		s, err := q.Select(nil, mset...)
 		if err != nil {
 			return nil, &apiError{errorExec, err}
 		}
@@ -464,7 +469,8 @@ func (api *API) targets(r *http.Request) (interface{}, *apiError) {
 
 // AlertmanagerDiscovery has all the active Alertmanagers.
 type AlertmanagerDiscovery struct {
-	ActiveAlertmanagers []*AlertmanagerTarget `json:"activeAlertmanagers"`
+	ActiveAlertmanagers  []*AlertmanagerTarget `json:"activeAlertmanagers"`
+	DroppedAlertmanagers []*AlertmanagerTarget `json:"droppedAlertmanagers"`
 }
 
 // AlertmanagerTarget has info on one AM.
@@ -474,12 +480,14 @@ type AlertmanagerTarget struct {
 
 func (api *API) alertmanagers(r *http.Request) (interface{}, *apiError) {
 	urls := api.alertmanagerRetriever.Alertmanagers()
-	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls))}
-
+	droppedURLS := api.alertmanagerRetriever.DroppedAlertmanagers()
+	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls)), DroppedAlertmanagers: make([]*AlertmanagerTarget, len(droppedURLS))}
 	for i, url := range urls {
 		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
 	}
-
+	for i, url := range droppedURLS {
+		ams.DroppedAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
+	}
 	return ams, nil
 }
 
@@ -492,6 +500,10 @@ func (api *API) serveConfig(r *http.Request) (interface{}, *apiError) {
 		YAML: api.config().String(),
 	}
 	return cfg, nil
+}
+
+func (api *API) serveFlags(r *http.Request) (interface{}, *apiError) {
+	return api.flagsMap, nil
 }
 
 func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
@@ -537,7 +549,7 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		set, err := querier.Select(filteredMatchers...)
+		set, err := querier.Select(nil, filteredMatchers...)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

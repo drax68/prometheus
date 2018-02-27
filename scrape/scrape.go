@@ -301,6 +301,10 @@ func (sp *scrapePool) sync(targets []*Target) {
 			sp.loops[hash] = l
 
 			go l.run(interval, timeout, nil)
+		} else {
+			// Need to keep the most updated labels information
+			// for displaying it in the Service Discovery web page.
+			sp.targets[hash].SetDiscoveredLabels(t.DiscoveredLabels())
 		}
 	}
 
@@ -332,7 +336,7 @@ func (sp *scrapePool) mutateSampleLabels(lset labels.Labels, target *Target) lab
 
 	if sp.config.HonorLabels {
 		for _, l := range target.Labels() {
-			if lv := lset.Get(l.Name); lv == "" {
+			if !lset.Has(l.Name) {
 				lb.Set(l.Name, l.Value)
 			}
 		}
@@ -343,6 +347,12 @@ func (sp *scrapePool) mutateSampleLabels(lset labels.Labels, target *Target) lab
 				lb.Set(model.ExportedLabelPrefix+l.Name, lv)
 			}
 			lb.Set(l.Name, l.Value)
+		}
+	}
+
+	for _, l := range lb.Labels() {
+		if l.Value == "" {
+			lb.Del(l.Name)
 		}
 	}
 
