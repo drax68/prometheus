@@ -50,6 +50,7 @@ const (
 type engineMetrics struct {
 	currentQueries       prometheus.Gauge
 	maxConcurrentQueries prometheus.Gauge
+	queryQueueTime       prometheus.Summary
 	queryPrepareTime     prometheus.Summary
 	queryInnerEval       prometheus.Summary
 	queryResultAppend    prometheus.Summary
@@ -176,6 +177,13 @@ func NewEngine(logger log.Logger, reg prometheus.Registerer, maxConcurrent int, 
 			Subsystem: subsystem,
 			Name:      "queries_concurrent_max",
 			Help:      "The max number of concurrent queries.",
+		}),
+		queryQueueTime: prometheus.NewSummary(prometheus.SummaryOpts{
+			Namespace:   namespace,
+			Subsystem:   subsystem,
+			Name:        "query_duration_seconds",
+			Help:        "Query timings",
+			ConstLabels: prometheus.Labels{"slice": "queue_time"},
 		}),
 		queryPrepareTime: prometheus.NewSummary(prometheus.SummaryOpts{
 			Namespace:   namespace,
@@ -308,6 +316,7 @@ func (ng *Engine) exec(ctx context.Context, q *query) (Value, error) {
 	defer ng.gate.Done()
 
 	queueTimer.Stop()
+	ng.metrics.queryQueueTime.Observe(queueTimer.ElapsedTime().Seconds())
 
 	// Cancel when execution is done or an error was raised.
 	defer q.cancel()
@@ -1324,14 +1333,19 @@ func (ev *evaluator) aggregation(op ItemType, grouping []string, without bool, p
 				valuesSquaredSum: s.V * s.V,
 				groupCount:       1,
 			}
+			input_vec_len := int64(len(vec))
+			result_size := k
+			if k > input_vec_len {
+				result_size = input_vec_len
+			}
 			if op == itemTopK || op == itemQuantile {
-				result[groupingKey].heap = make(vectorByValueHeap, 0, k)
+				result[groupingKey].heap = make(vectorByValueHeap, 0, result_size)
 				heap.Push(&result[groupingKey].heap, &Sample{
 					Point:  Point{V: s.V},
 					Metric: s.Metric,
 				})
 			} else if op == itemBottomK {
-				result[groupingKey].reverseHeap = make(vectorByReverseValueHeap, 0, k)
+				result[groupingKey].reverseHeap = make(vectorByReverseValueHeap, 0, result_size)
 				heap.Push(&result[groupingKey].reverseHeap, &Sample{
 					Point:  Point{V: s.V},
 					Metric: s.Metric,
